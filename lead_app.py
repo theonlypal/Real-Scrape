@@ -83,25 +83,30 @@ def geocode_place(place: str):
     geolocator = Nominatim(user_agent="streamlit-lead-app")
     for _ in range(3):
         try:
-            location = geolocator.geocode(place, timeout=10)
-            if location:
-                return location.latitude, location.longitude
+            loc = geolocator.geocode(place, timeout=10)
+            if loc:
+                return loc.latitude, loc.longitude
         except (GeocoderTimedOut, GeocoderUnavailable):
             time.sleep(1)
-    st.error(f"❌ Could not geocode '{place}'. Please try a different ZIP or place name.")
+    st.error(f"❌ Could not geocode '{place}'. Try a different ZIP or place.")
     st.stop()
 
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def overpass_query(lat: float, lon: float, radius: int, verticals: list, days: int):
     api = overpy.Overpass()
     date_limit = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-    queries = []
+    # build a union of node queries
+    parts = []
     for name in verticals:
         tags = VERTICAL_TAGS[name]
-        filters = ''.join(f'[{k}="{v}"]' for k, v in tags.items())
-        q = f"node{filters}(around:{radius * 1609},{lat},{lon})[opening_date>\"{date_limit}\"];out;"
-        queries.append(q)
-    query = ';'.join(queries)
+        # assume one tag per vertical
+        for k, v in tags.items():
+            parts.append(
+                f'node[{k}="{v}"](around:{radius*1609},{lat},{lon})'
+                f'[opening_date>"{date_limit}"];'
+            )
+    union = "(" + "".join(parts) + ")"
+    query = f"[out:json];{union};out center;"
     return api.query(query)
 
 def compute_lead_score(row) -> int:
@@ -120,26 +125,23 @@ def main():
     init_db()
     st.title("Local Lead Generator")
 
-    # Sidebar controls
     with st.sidebar:
         place = st.text_input("ZIP or Place", "10001")
         radius = st.selectbox("Radius (miles)", [10, 15, 25], index=0)
-        vertical_options = list(VERTICAL_TAGS.keys())
-        selected_verticals = st.multiselect("Target Verticals", vertical_options, default=vertical_options[:3])
+        verticals = st.multiselect("Target Verticals", list(VERTICAL_TAGS.keys()),
+                                   default=list(VERTICAL_TAGS.keys())[:3])
         days = st.slider("New within N days", 1, 30, 14)
         if st.button("Refresh Leads"):
             st.cache_data.clear()
 
-    # Geocode and show map
     lat, lon = geocode_place(place)
     st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}))
 
-    # Fetch POIs
-    result = overpass_query(lat, lon, radius, selected_verticals, days)
+    # Fetch and process
+    result = overpass_query(lat, lon, radius, verticals, days)
     income_df = load_income_data()
     called_ids = load_called_ids()
 
-    # Build lead list
     leads = []
     for node in result.nodes:
         if 'website' in node.tags:
@@ -151,23 +153,25 @@ def main():
         if not opening:
             continue
         try:
-            newness = (datetime.utcnow() - datetime.strptime(opening, "%Y-%m-%d")).days
-        except Exception:
+            newness = (datetime.utcnow() -
+                       datetime.fromisoformat(opening)).days
+        except:
             continue
 
-        zip_code = node.tags.get('addr:postcode', '')
-        income_row = income_df[income_df['zip'] == zip_code]
-        if not income_row.empty:
-            income = income_row.iloc[0]['median_income']
-            tier = 'High' if income >= 80000 else 'Medium' if income >= 60000 else 'Low'
+        zip_code = node.tags.get('addr:postcode','')
+        inc_row = income_df[income_df['zip']==zip_code]
+        if not inc_row.empty:
+            inc = inc_row.iloc[0]['median_income']
+            tier = 'High' if inc>=80000 else 'Medium' if inc>=60000 else 'Low'
         else:
             tier = 'Unknown'
 
         email = node.tags.get('email') or node.tags.get('contact:email')
         social = node.tags.get('contact:facebook') or node.tags.get('contact:instagram')
-        name = node.tags.get('name', 'Unknown')
+        name = node.tags.get('name','Unknown')
         industry = next(
-            (k for k, v in VERTICAL_TAGS.items() if all(node.tags.get(tk) == tv for tk, tv in v.items())),
+            (k for k,v in VERTICAL_TAGS.items()
+             if all(node.tags.get(tk)==tv for tk,tv in v.items())),
             'Other'
         )
         slug = slugify(name)
@@ -177,7 +181,7 @@ def main():
             'osm_id': str(node.id),
             'name': name,
             'industry': industry,
-            'address': node.tags.get('addr:full', ''),
+            'address': node.tags.get('addr:full',''),
             'phone': phone,
             'email/social': email or social or '',
             'newness_days': newness,
@@ -192,9 +196,9 @@ def main():
     df = pd.DataFrame(leads)
 
     # Quick filters
-    filters = st.multiselect("Quick Filters", ['High Income', 'Not Called'])
+    filters = st.multiselect("Quick Filters", ['High Income','Not Called'])
     if 'High Income' in filters:
-        df = df[df['income_tier'] == 'High']
+        df = df[df['income_tier']=='High']
     if 'Not Called' in filters:
         df = df[~df['osm_id'].isin(called_ids)]
 
@@ -206,13 +210,12 @@ def main():
     st.write("### Leads")
     edited = st.data_editor(df, num_rows="dynamic")
 
-    # Call & log
     for _, row in edited.iterrows():
         st.markdown(f"**{row['name']}**")
         st.write(f"📞 [Call]({f'tel:{quote_plus(row['phone'])}'})")
         outcome = st.selectbox(
             "Outcome",
-            ["Uncalled", "Connected", "Voicemail", "No Answer"],
+            ["Uncalled","Connected","Voicemail","No Answer"],
             key=f"outcome_{row['osm_id']}"
         )
         if outcome != "Uncalled":
@@ -220,15 +223,14 @@ def main():
         st.write(f"[Demo Link]({row['demo_link']})")
         st.write("---")
 
-    # Export and SMS template
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Export to CSV"):
             df.to_csv("leads_export.csv", index=False)
             st.success("Exported to leads_export.csv")
     with col2:
-        sms_template = f"Check out our demo: {df.iloc[0]['demo_link']}" if not df.empty else ''
-        st.text_input("SMS Template", sms_template)
+        sms = f"Check out our demo: {df.iloc[0]['demo_link']}" if not df.empty else ''
+        st.text_input("SMS Template", sms)
 
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
