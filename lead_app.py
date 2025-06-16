@@ -11,10 +11,9 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 import overpy
 
-# Constants
+# --- Constants & Config ---
 INCOME_CSV = os.path.join('data', 'zip_income_sample.csv')
 CACHE_DB = 'lead_cache.db'
-
 VERTICAL_TAGS = {
     'Plumbing': {'craft': 'plumber'},
     'Cafe': {'amenity': 'cafe'},
@@ -23,45 +22,38 @@ VERTICAL_TAGS = {
     'Specialty Retail': {'shop': 'electronics'}
 }
 
+# --- Helpers & Persistence ---
 def slugify(value: str) -> str:
     return ''.join(c if c.isalnum() else '-' for c in value.lower()).strip('-')
 
 def init_db():
     conn = sqlite3.connect(CACHE_DB)
     c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS leads (
-            osm_id TEXT PRIMARY KEY,
-            data TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS calls (
-            osm_id TEXT,
-            outcome TEXT,
-            timestamp TEXT
-        )
-    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS leads (
+                    osm_id TEXT PRIMARY KEY,
+                    data TEXT
+                 )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS calls (
+                    osm_id TEXT,
+                    outcome TEXT,
+                    timestamp TEXT
+                 )""")
     conn.commit()
     conn.close()
 
 def save_lead(osm_id: str, data: dict):
     conn = sqlite3.connect(CACHE_DB)
     c = conn.cursor()
-    c.execute(
-        "INSERT OR IGNORE INTO leads(osm_id, data) VALUES(?, ?)",
-        (osm_id, json.dumps(data))
-    )
+    c.execute("INSERT OR IGNORE INTO leads(osm_id, data) VALUES(?, ?)",
+              (osm_id, json.dumps(data)))
     conn.commit()
     conn.close()
 
 def mark_call(osm_id: str, outcome: str):
     conn = sqlite3.connect(CACHE_DB)
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO calls(osm_id, outcome, timestamp) VALUES(?, ?, ?)",
-        (osm_id, outcome, datetime.utcnow().isoformat())
-    )
+    c.execute("INSERT INTO calls(osm_id, outcome, timestamp) VALUES(?, ?, ?)",
+              (osm_id, outcome, datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
 
@@ -78,6 +70,7 @@ def load_income_data() -> pd.DataFrame:
     df['zip'] = df['zip'].astype(str).str.zfill(5)
     return df
 
+# --- Geocoding & Caching ---
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def geocode_place(place: str):
     geolocator = Nominatim(user_agent="streamlit-lead-app")
@@ -91,24 +84,34 @@ def geocode_place(place: str):
     st.error(f"❌ Could not geocode '{place}'. Try a different ZIP or place.")
     st.stop()
 
+# --- Overpass Query & Caching ---
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def overpass_query(lat: float, lon: float, radius: int, verticals: list, days: int):
     api = overpy.Overpass()
     date_limit = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-    # build a union of node queries
     parts = []
     for name in verticals:
         tags = VERTICAL_TAGS[name]
-        # assume one tag per vertical
         for k, v in tags.items():
             parts.append(
-                f'node[{k}="{v}"](around:{radius*1609},{lat},{lon})'
+                f'  node[{k}="{v}"](around:{radius*1609},{lat},{lon})'
                 f'[opening_date>"{date_limit}"];'
             )
-    union = "(" + "".join(parts) + ")"
-    query = f"[out:json];{union};out center;"
-    return api.query(query)
+    combined = "\n".join(parts)
+    query = f"""
+[out:json][timeout:25];
+(
+{combined}
+);
+out center;
+"""
+    try:
+        return api.query(query)
+    except overpy.exception.OverpassBadRequest:
+        st.error("⚠️ Overpass query failed. Try a wider radius or shorter date range.")
+        st.stop()
 
+# --- Lead Scoring ---
 def compute_lead_score(row) -> int:
     score = max(0, 30 - row['newness_days'])
     if row['phone']:
@@ -121,23 +124,29 @@ def compute_lead_score(row) -> int:
         score += 5
     return score
 
+# --- Main App ---
 def main():
     init_db()
     st.title("Local Lead Generator")
 
+    # Sidebar controls
     with st.sidebar:
         place = st.text_input("ZIP or Place", "10001")
         radius = st.selectbox("Radius (miles)", [10, 15, 25], index=0)
-        verticals = st.multiselect("Target Verticals", list(VERTICAL_TAGS.keys()),
-                                   default=list(VERTICAL_TAGS.keys())[:3])
+        verticals = st.multiselect(
+            "Target Verticals",
+            list(VERTICAL_TAGS.keys()),
+            default=list(VERTICAL_TAGS.keys())[:3]
+        )
         days = st.slider("New within N days", 1, 30, 14)
         if st.button("Refresh Leads"):
             st.cache_data.clear()
 
+    # Geocode & display map
     lat, lon = geocode_place(place)
     st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}))
 
-    # Fetch and process
+    # Fetch POIs and process
     result = overpass_query(lat, lon, radius, verticals, days)
     income_df = load_income_data()
     called_ids = load_called_ids()
@@ -153,25 +162,24 @@ def main():
         if not opening:
             continue
         try:
-            newness = (datetime.utcnow() -
-                       datetime.fromisoformat(opening)).days
+            newness = (datetime.utcnow() - datetime.fromisoformat(opening)).days
         except:
             continue
 
-        zip_code = node.tags.get('addr:postcode','')
-        inc_row = income_df[income_df['zip']==zip_code]
+        zip_code = node.tags.get('addr:postcode', '')
+        inc_row = income_df[income_df['zip'] == zip_code]
         if not inc_row.empty:
             inc = inc_row.iloc[0]['median_income']
-            tier = 'High' if inc>=80000 else 'Medium' if inc>=60000 else 'Low'
+            tier = 'High' if inc >= 80000 else 'Medium' if inc >= 60000 else 'Low'
         else:
             tier = 'Unknown'
 
         email = node.tags.get('email') or node.tags.get('contact:email')
         social = node.tags.get('contact:facebook') or node.tags.get('contact:instagram')
-        name = node.tags.get('name','Unknown')
+        name = node.tags.get('name', 'Unknown')
         industry = next(
-            (k for k,v in VERTICAL_TAGS.items()
-             if all(node.tags.get(tk)==tv for tk,tv in v.items())),
+            (k for k, v in VERTICAL_TAGS.items()
+             if all(node.tags.get(tk) == tv for tk, tv in v.items())),
             'Other'
         )
         slug = slugify(name)
@@ -181,7 +189,7 @@ def main():
             'osm_id': str(node.id),
             'name': name,
             'industry': industry,
-            'address': node.tags.get('addr:full',''),
+            'address': node.tags.get('addr:full', ''),
             'phone': phone,
             'email/social': email or social or '',
             'newness_days': newness,
@@ -196,9 +204,9 @@ def main():
     df = pd.DataFrame(leads)
 
     # Quick filters
-    filters = st.multiselect("Quick Filters", ['High Income','Not Called'])
+    filters = st.multiselect("Quick Filters", ['High Income', 'Not Called'])
     if 'High Income' in filters:
-        df = df[df['income_tier']=='High']
+        df = df[df['income_tier'] == 'High']
     if 'Not Called' in filters:
         df = df[~df['osm_id'].isin(called_ids)]
 
@@ -210,12 +218,13 @@ def main():
     st.write("### Leads")
     edited = st.data_editor(df, num_rows="dynamic")
 
+    # Call & log
     for _, row in edited.iterrows():
         st.markdown(f"**{row['name']}**")
         st.write(f"📞 [Call]({f'tel:{quote_plus(row['phone'])}'})")
         outcome = st.selectbox(
             "Outcome",
-            ["Uncalled","Connected","Voicemail","No Answer"],
+            ["Uncalled", "Connected", "Voicemail", "No Answer"],
             key=f"outcome_{row['osm_id']}"
         )
         if outcome != "Uncalled":
@@ -223,6 +232,7 @@ def main():
         st.write(f"[Demo Link]({row['demo_link']})")
         st.write("---")
 
+    # Export & SMS
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Export to CSV"):
@@ -232,5 +242,5 @@ def main():
         sms = f"Check out our demo: {df.iloc[0]['demo_link']}" if not df.empty else ''
         st.text_input("SMS Template", sms)
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
