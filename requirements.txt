@@ -3,3 +3,5 @@ requests
 overpy
 pandas
 geopy
+gspread
+google-auth
